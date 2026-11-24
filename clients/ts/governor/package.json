@@ -1,0 +1,36 @@
+{
+  "name": "@batch-governor/governor",
+  "version": "0.1.0",
+  "description": "Drop-in Anthropic SDK subclass that routes batches through the batch-governor (POST /v1/check + /v1/submit).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./exceptions": {
+      "import": "./dist/exceptions.js",
+      "types": "./dist/exceptions.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

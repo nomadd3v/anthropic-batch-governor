@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd configuration for the batch-governor active monitor (watchdog).
+
+  Env + secrets (REDIS_URL, ANTHROPIC_API_KEY, SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY) are loaded via `launchctl setenv` before install.
+  Monitor-specific knobs (MONITOR_POLL_INTERVAL_SECONDS,
+  MONITOR_RUNAWAY_MULTIPLIER, MONITOR_ROGUE_GRACE_SECONDS) have safe defaults
+  and can be overridden the same way. Legacy UPSTASH_REDIS_REST_* vars are
+  accepted only as a fallback when REDIS_URL is unset (ADR-002 → ADR-007).
+  See `launchd/install.sh` and README.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.batchgovernor.monitor</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/batch-governor/launchd/run-monitor.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/batch-governor</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/batch-governor-monitor.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/batch-governor-monitor.err.log</string>
+</dict>
+</plist>

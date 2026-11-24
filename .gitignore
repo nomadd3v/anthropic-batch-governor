@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.venv/
+venv/
+env/
+
+# Node / TS
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.next/
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Runtime / logs
+*.log
+/tmp/
+governor-ledger-queue/
+
+# Keep launchd plists but not installed-state artifacts
+launchd/*.installed
+ARCH.md

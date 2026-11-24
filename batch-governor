@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+#
+# batch-governor — CLI wrapper around the batch-governor HTTP service.
+#
+# Mirrors the style of a sibling lock CLI:
+# small, dependency-light, friendly output, clear exit codes. Shell callers
+# can rely on:
+#
+#   exit 0  — command succeeded (APPROVED decisions, OK responses)
+#   exit 1  — command failed (DENIED decisions, service errors)
+#   exit 2  — usage error (bad arguments)
+#
+# Dependencies: curl + jq. Nothing else.
+#
+# Usage:
+#   batch-governor check <app> <requests.jsonl>
+#   batch-governor submit <app> <requests.jsonl>
+#   batch-governor status [app]
+#   batch-governor kill <batch_id>
+#   batch-governor kill-switch on "reason" | off
+#   batch-governor ledger tail [n]
+#   batch-governor budget <app>
+#   batch-governor help
+#
+# Environment:
+#   GOVERNOR_BASE_URL — default http://127.0.0.1:5185
+
+set -euo pipefail
+
+GOVERNOR_BASE_URL="${GOVERNOR_BASE_URL:-http://127.0.0.1:5185}"
+DEFAULT_MODEL="${GOVERNOR_DEFAULT_MODEL:-claude-haiku-4-5-20251001}"
+DEFAULT_OPERATION="${GOVERNOR_DEFAULT_OPERATION:-default}"
+DEFAULT_CACHE_MODE="${GOVERNOR_DEFAULT_CACHE_MODE:-none}"
+
+# --- helpers ---
+
+_die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+_need_jq() {
+    if ! command -v jq >/dev/null 2>&1; then
+        _die "jq is required — install via 'brew install jq'"
+    fi
+}
+
+_need_curl() {
+    if ! command -v curl >/dev/null 2>&1; then
+        _die "curl is required (most systems ship with it)"
+    fi
+}
+
+# Perform a request against the governor. Prints the response body to stdout.
+# Non-zero exit on transport failure with a "is the service running?" hint.
+_api() {
+    local method="$1"
+    local path="$2"
+    local body="${3:-}"
+
+    _need_curl
+    local curl_args=(
+        -sS
+        --max-time 30
+        -w "\n%{http_code}"
+        -X "$method"
+        -H "Content-Type: application/json"
+    )
+    if [[ -n "$body" ]]; then
+        curl_args+=(--data "$body")
+    fi
+
+    local raw
+    if ! raw="$(curl "${curl_args[@]}" "${GOVERNOR_BASE_URL}${path}" 2>&1)"; then
+        echo "ERROR: cannot reach governor at ${GOVERNOR_BASE_URL}${path}" >&2
+        echo "       is the service running on :5185? Start with:" >&2
+        echo "       uvicorn server.app:app --host 127.0.0.1 --port 5185" >&2
+        exit 1
+    fi
+
+    local body_part status_part
+    body_part="$(printf '%s' "$raw" | sed '$d')"
+    status_part="$(printf '%s' "$raw" | tail -n1)"
+
+    if [[ "$status_part" -ge 500 ]]; then
+        echo "ERROR: governor returned HTTP $status_part" >&2
+        echo "$body_part" >&2
+        exit 1
+    fi
+    if [[ "$status_part" -ge 400 ]]; then
+        # 4xx is often a legitimate DENIED-like response the caller wants
+        # to inspect — print body so the user sees the detail, but still
+        # signal failure.
+        printf '%s\n' "$body_part"
+        return 1
+    fi
+
+    printf '%s\n' "$body_part"
+    return 0
+}
+
+# Count lines (= requests) in a JSONL file, rejecting empty files.
+_count_requests() {
+    local file="$1"
+    local count
+    count=$(grep -c '' "$file" 2>/dev/null || echo 0)
+    if [[ "$count" -eq 0 ]]; then
+        _die "no requests in $file (empty file?)"
+    fi
+    echo "$count"
+}
+
+# Build a /calc/project-batch payload from a requests.jsonl file.
+# Writes the projection JSON to stdout.
+_project_batch_from_file() {
+    local requests_file="$1"
+    local model="${2:-$DEFAULT_MODEL}"
+    local operation="${3:-$DEFAULT_OPERATION}"
+    local cache_mode="${4:-$DEFAULT_CACHE_MODE}"
+    local shared_tokens="${5:-0}"
+
+    _need_jq
+    local n_requests
+    n_requests="$(_count_requests "$requests_file")"
+
+    # Build a stub request list: one entry per line in the JSONL file.
+    # We estimate the unique input as 100 tokens / request — good enough
+    # for the gate which reads per-batch p95_usd. Callers that need a real
+    # projection should pass --shared-tokens / etc. explicitly.
+    local requests_json
+    requests_json="$(jq -n --argjson n "$n_requests" \
+        '[range(0; $n) | {unique_input_tokens: 100}]')"
+
+    local body
+    body=$(jq -n \
+        --argjson requests "$requests_json" \
+        --argjson shared "$shared_tokens" \
+        --arg model "$model" \
+        --arg operation "$operation" \
+        --arg cache_mode "$cache_mode" \
+        '{requests: $requests, shared_system_tokens: $shared,
+          cache_mode: $cache_mode, model: $model, operation: $operation}')
+
+    _api POST /calc/project-batch "$body"
+}
+
+# Fingerprint = sha256 of the requests.jsonl contents (first 40 hex chars).
+_fingerprint_file() {
+    local file="$1"
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | awk '{print substr($1, 1, 40)}'
+    else
+        sha256sum "$file" | awk '{print substr($1, 1, 40)}'
+    fi
+}
+
+# --- commands ---
+
+cmd_help() {
+    cat <<'EOF'
+batch-governor — CLI for the batch-governor service
+
+Usage:
+  batch-governor check <app> <requests.jsonl>
+      Run pre-submit gate. Exit 0 on APPROVED, 1 on DENIED.
+
+  batch-governor submit <app> <requests.jsonl>
+      Check + submit. Prints the batch id on success.
+
+  batch-governor status [app]
+      Show in-flight batches, per-app spend, kill-switch state.
+
+  batch-governor kill <batch_id>
+      Cancel a batch at Anthropic.
+
+  batch-governor kill-switch on "reason" | off
+      Enable/disable the global kill switch.
+
+  batch-governor ledger tail [n]
+      Show the last N decisions (n defaults to 20). Requires
+      Supabase access in env.
+
+  batch-governor budget <app>
+      Show the app's configured caps from config/apps.yaml.
+
+  batch-governor help
+      Show this help.
+
+Environment:
+  GOVERNOR_BASE_URL        — default http://127.0.0.1:5185
+  GOVERNOR_DEFAULT_MODEL   — default claude-haiku-4-5-20251001
+  GOVERNOR_DEFAULT_OPERATION — default "default"
+  GOVERNOR_DEFAULT_CACHE_MODE — default none
+
+Exit codes:
+  0 — success (APPROVED decisions, OK responses)
+  1 — failure (DENIED decisions, service errors)
+  2 — usage error (bad arguments)
+EOF
+}
+
+cmd_check() {
+    local app="${1:?Usage: batch-governor check <app> <requests.jsonl>}"
+    local requests_file="${2:?Usage: batch-governor check <app> <requests.jsonl>}"
+    [[ -f "$requests_file" ]] || _die "file not found: $requests_file"
+
+    _need_jq
+    local projection
+    projection="$(_project_batch_from_file "$requests_file")" \
+        || _die "/calc/project-batch failed"
+
+    # Extract p50/p95 and cache break-even flag from the full projection.
+    local p50_usd p95_usd break_even
+    p50_usd="$(printf '%s' "$projection" | jq '.total_p50_usd // .p50_usd')"
+    p95_usd="$(printf '%s' "$projection" | jq '.total_p95_usd // .p95_usd')"
+    break_even="$(printf '%s' "$projection" | jq '.cache_break_even_warning // false')"
+
+    local fingerprint
+    fingerprint="$(_fingerprint_file "$requests_file")"
+
+    # Read one request line to pick up custom_id and model, but send the
+    # full file as an array so the gate can validate every custom_id.
+    local requests_array
+    requests_array="$(jq -s '.' "$requests_file")"
+
+    local body
+    body=$(jq -n \
+        --arg app "$app" \
+        --arg fingerprint "$fingerprint" \
+        --arg model "$DEFAULT_MODEL" \
+        --arg cache_mode "$DEFAULT_CACHE_MODE" \
+        --argjson requests "$requests_array" \
+        --argjson p50_usd "$p50_usd" \
+        --argjson p95_usd "$p95_usd" \
+        --argjson break_even "$break_even" \
+        '{app: $app, requests: $requests, model: $model,
+          projection: {p50_usd: $p50_usd, p95_usd: $p95_usd,
+                       cache_break_even_warning: $break_even},
+          fingerprint: $fingerprint, cache_mode: $cache_mode}')
+
+    local response
+    if ! response="$(_api POST /v1/check "$body")"; then
+        # HTTP error path already printed body to stdout.
+        exit 1
+    fi
+
+    printf '%s\n' "$response" | jq .
+    local decision
+    decision="$(printf '%s' "$response" | jq -r '.decision')"
+    if [[ "$decision" != "APPROVED" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+cmd_submit() {
+    local app="${1:?Usage: batch-governor submit <app> <requests.jsonl>}"
+    local requests_file="${2:?Usage: batch-governor submit <app> <requests.jsonl>}"
+    [[ -f "$requests_file" ]] || _die "file not found: $requests_file"
+
+    _need_jq
+    local projection
+    projection="$(_project_batch_from_file "$requests_file")" \
+        || _die "/calc/project-batch failed"
+
+    local p50_usd p95_usd break_even
+    p50_usd="$(printf '%s' "$projection" | jq '.total_p50_usd // .p50_usd')"
+    p95_usd="$(printf '%s' "$projection" | jq '.total_p95_usd // .p95_usd')"
+    break_even="$(printf '%s' "$projection" | jq '.cache_break_even_warning // false')"
+
+    local fingerprint
+    fingerprint="$(_fingerprint_file "$requests_file")"
+
+    local requests_array
+    requests_array="$(jq -s '.' "$requests_file")"
+
+    local check_body
+    check_body=$(jq -n \
+        --arg app "$app" \
+        --arg fingerprint "$fingerprint" \
+        --arg model "$DEFAULT_MODEL" \
+        --arg cache_mode "$DEFAULT_CACHE_MODE" \
+        --argjson requests "$requests_array" \
+        --argjson p50_usd "$p50_usd" \
+        --argjson p95_usd "$p95_usd" \
+        --argjson break_even "$break_even" \
+        '{app: $app, requests: $requests, model: $model,
+          projection: {p50_usd: $p50_usd, p95_usd: $p95_usd,
+                       cache_break_even_warning: $break_even},
+          fingerprint: $fingerprint, cache_mode: $cache_mode}')
+
+    local check_response
+    if ! check_response="$(_api POST /v1/check "$check_body")"; then
+        exit 1
+    fi
+
+    local decision
+    decision="$(printf '%s' "$check_response" | jq -r '.decision')"
+    if [[ "$decision" != "APPROVED" ]]; then
+        printf '%s\n' "$check_response" | jq .
+        return 1
+    fi
+
+    local approval_id
+    approval_id="$(printf '%s' "$check_response" | jq -r '.approval_id')"
+    local submit_body
+    submit_body=$(jq -n --arg id "$approval_id" '{approval_id: $id}')
+    local submit_response
+    submit_response="$(_api POST /v1/submit "$submit_body")" || return 1
+    printf '%s\n' "$submit_response" | jq .
+    return 0
+}
+
+cmd_status() {
+    local app="${1:-}"
+    local response
+    response="$(_api GET /v1/status)" || return 1
+    if [[ -n "$app" ]]; then
+        printf '%s\n' "$response" | jq --arg app "$app" \
+            '{in_flight,
+              kill_switch,
+              monitor_alive,
+              daily: [.daily[] | select(.app == $app)],
+              monthly: [.monthly[] | select(.app == $app)]}'
+    else
+        printf '%s\n' "$response" | jq .
+    fi
+    return 0
+}
+
+cmd_kill() {
+    local batch_id="${1:?Usage: batch-governor kill <batch_id>}"
+    local response
+    response="$(_api POST "/v1/kill/${batch_id}")" || return 1
+    printf '%s\n' "$response" | jq .
+    return 0
+}
+
+cmd_kill_switch() {
+    local action="${1:?Usage: batch-governor kill-switch on \"reason\" | off}"
+    local reason="${2:-}"
+    local body
+    if [[ "$action" == "on" ]]; then
+        body=$(jq -n --arg reason "${reason:-unspecified}" \
+            '{on: true, reason: $reason}')
+    elif [[ "$action" == "off" ]]; then
+        body='{"on": false}'
+    else
+        _die "unknown kill-switch action: $action (expected on|off)"
+    fi
+    local response
+    response="$(_api POST /v1/kill-switch "$body")" || return 1
+    printf '%s\n' "$response" | jq .
+    return 0
+}
+
+cmd_ledger() {
+    local sub="${1:-tail}"
+    local n="${2:-20}"
+    if [[ "$sub" != "tail" ]]; then
+        _die "unknown ledger subcommand: $sub"
+    fi
+    # Ledger query is currently surfaced via /v1/status in-flight set only;
+    # full ledger tailing ships with Stream E. For now, we point the user
+    # at Supabase.
+    echo "ledger tail is not yet exposed over HTTP (arrives in Stream E)."
+    echo "Inspect Supabase directly:"
+    echo "  psql \"\$SUPABASE_DB_URL\" -c \\"
+    echo "    'select ts, app, decision, model, projected_p95_usd "
+    echo "     from governor.decisions order by ts desc limit ${n};'"
+    return 0
+}
+
+cmd_budget() {
+    local app="${1:?Usage: batch-governor budget <app>}"
+    # The budget endpoint is surfaced inside /v1/status; we filter locally.
+    local response
+    response="$(_api GET /v1/status)" || return 1
+    local daily monthly
+    daily="$(printf '%s' "$response" | jq --arg app "$app" \
+        '.daily[] | select(.app == $app)')"
+    monthly="$(printf '%s' "$response" | jq --arg app "$app" \
+        '.monthly[] | select(.app == $app)')"
+    if [[ -z "$daily" ]] || [[ "$daily" == "null" ]]; then
+        echo "no budget entry for app '$app' — falling back to 'default' caps."
+        daily="$(printf '%s' "$response" | jq '.daily[] | select(.app == "default")')"
+        monthly="$(printf '%s' "$response" | jq '.monthly[] | select(.app == "default")')"
+    fi
+    jq -n \
+        --argjson daily "$daily" \
+        --argjson monthly "$monthly" \
+        '{app: $daily.app, daily: $daily, monthly: $monthly}'
+    return 0
+}
+
+# --- main ---
+
+case "${1:-help}" in
+    check)        shift; cmd_check "$@" ;;
+    submit)       shift; cmd_submit "$@" ;;
+    status)       shift; cmd_status "$@" ;;
+    kill)         shift; cmd_kill "$@" ;;
+    kill-switch)  shift; cmd_kill_switch "$@" ;;
+    ledger)       shift; cmd_ledger "$@" ;;
+    budget)       shift; cmd_budget "$@" ;;
+    help|--help|-h) cmd_help ;;
+    *)
+        echo "ERROR: unknown subcommand: ${1}" >&2
+        echo "" >&2
+        cmd_help >&2
+        exit 2
+        ;;
+esac

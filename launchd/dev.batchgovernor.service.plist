@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd configuration for the batch-governor FastAPI service.
+
+  Env + secrets are NOT embedded in this file. They must be loaded into the
+  launchd user-agent environment before install via `launchctl setenv`:
+
+    launchctl setenv REDIS_URL "$REDIS_URL"           # ADR-007, default redis://127.0.0.1:6379/0
+    launchctl setenv ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"
+    launchctl setenv SUPABASE_URL "$SUPABASE_URL"
+    launchctl setenv SUPABASE_SERVICE_ROLE_KEY "$SUPABASE_SERVICE_ROLE_KEY"
+
+  Legacy Upstash REST vars are accepted only as a fallback when REDIS_URL is
+  unset (see ADR-002, superseded by ADR-007):
+    # launchctl setenv UPSTASH_REDIS_REST_URL   "$UPSTASH_REDIS_REST_URL"
+    # launchctl setenv UPSTASH_REDIS_REST_TOKEN "$UPSTASH_REDIS_REST_TOKEN"
+
+  `launchd/install.sh` handles this step by sourcing the operator's shell
+  environment (direnv + Keychain). Do not hard-code credentials here.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.batchgovernor.service</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/batch-governor/launchd/run-service.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/batch-governor</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/batch-governor.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/batch-governor.err.log</string>
+</dict>
+</plist>

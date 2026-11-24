@@ -1,0 +1,61 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# config/apps.yaml — per-app caps and model allowlist for the batch-governor.
+#
+# EVERY app that routes through the governor must have an entry here. When an
+# app is not listed the governor falls back to `default` (conservative caps,
+# Haiku only, daemon forbidden).
+#
+# RULES (non-negotiable — see README.md):
+#   1. No credentials in this file. Env vars only (ANTHROPIC_API_KEY, etc.).
+#   2. Widening any cap requires an ADR entry explaining why + rollback plan.
+#   3. `allow_daemon: true` is reserved for daemons with a documented budget
+#      and watchdog integration. Default is false — flipping it to true for
+#      deploy_agent.py specifically is what brings that process back online.
+#   4. `max_batch_size: 0` means "this app must not submit batches" — used for
+#      single-shot callers that only want calibration/cost projection.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Optional file-level governor mode (config-file equivalent of GOVERNOR_MODE;
+# the env var takes precedence). `enforcing` (default) denies rule violations;
+# `permissive` approves-and-flags them for review instead. See README.md.
+# governor_mode: enforcing
+
+defaults: &defaults
+  max_batch_size: 40
+  per_submit_cap_usd: 5.00
+  daily_ceiling_usd: 25.00
+  monthly_ceiling_usd: 300.00
+  allowed_models:
+    - claude-haiku-4-5-20251001
+  allow_daemon: false
+  allow_large_batch: false
+
+apps:
+  # Fallback used when an app name is not listed below. Conservative by design
+  # — unknown apps should stay small until they earn larger caps.
+  default:
+    <<: *defaults
+
+  # example-app's prospect-ranking batch path. Ranks are cheap inferences on
+  # small prompts; tighten the per-submit cap so a bug cannot burn a full $5.
+  example-rank-batch:
+    <<: *defaults
+    per_submit_cap_usd: 3.00
+
+  # example-app's long-running deploy agent. Originally burned $40–65 on
+  # 2026-04-15 when batch pipeline was inline. Batch pipeline extracted to
+  # batch_pipeline.py (CLI-only) on 2026-04-17 — deploy_agent now has ZERO
+  # Anthropic calls. Re-enabled 2026-04-21: daily_ceiling_usd is a backstop
+  # in case batch calls are ever re-added inline.
+  example-deploy-agent:
+    <<: *defaults
+    allow_daemon: true
+    daily_ceiling_usd: 15.00
+
+  # example-extractor is single-shot only per ADR-006 (batches-only scope).
+  # Listed here so the governor can still record calibration for its calls,
+  # but `max_batch_size: 0` means every attempted batch will be denied with
+  # BATCH_SIZE_EXCEEDED — that is the intended behavior.
+  example-extractor:
+    <<: *defaults
+    max_batch_size: 0
